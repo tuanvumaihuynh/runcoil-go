@@ -1,0 +1,6 @@
+# Local build and tool output
+bin/
+*.out
+*.test
+.DS_Store
+.env
