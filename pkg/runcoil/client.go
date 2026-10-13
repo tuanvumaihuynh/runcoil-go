@@ -12,7 +12,8 @@ import (
 	"net/http"
 	"net/url"
 
-	"connectrpc.com/connect"
+	"connectrpc.com/connect/v2"
+	"connectrpc.com/connect/v2/connecthttp"
 	runcoilv1connect "github.com/tuanvumaihuynh/runcoil-proto/gen/runcoil/v1/runcoilv1connect"
 )
 
@@ -47,11 +48,10 @@ func NewClient(opts ...ClientOption) (*Client, error) {
 
 	// No overall timeout: a Listen stream is open for as long as the worker runs.
 	httpClient := &http.Client{}
-	rpc := runcoilv1connect.NewWorkerServiceClient(
-		httpClient,
-		cfg.endpoint,
-		connect.WithInterceptors(bearer{value: "Bearer " + cfg.token}),
-	)
+	// No read limit: the default is 4 MiB per message, a dispatch can carry more,
+	// and the SDK holds no copy of the server's limits.
+	transport := connecthttp.NewTransport(httpClient, cfg.endpoint, connecthttp.WithReadMaxBytes(0))
+	rpc := runcoilv1connect.NewWorkerServiceClient(connect.NewClient(transport, bearer("Bearer "+cfg.token)))
 
 	return &Client{logger: cfg.logger, rpc: rpc}, nil
 }
@@ -106,26 +106,15 @@ func Logger(l *slog.Logger) ClientOption {
 	}
 }
 
-// bearer adds the Authorization header to every call, unary or streaming.
-type bearer struct {
-	value string
-}
-
-func (b bearer) WrapUnary(next connect.UnaryFunc) connect.UnaryFunc {
-	return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
-		req.Header().Set("Authorization", b.value)
-		return next(ctx, req)
+// bearer adds the Authorization header to every call, unary or streaming. The
+// header is set on the call's CallInfo before the stream opens, so it goes out
+// with the first message.
+func bearer(value string) connect.ClientInterceptor {
+	return func(next connect.ClientFunc) connect.ClientFunc {
+		return func(ctx context.Context, spec connect.Spec) (connect.ClientStream, error) {
+			ctx, info := connect.NewClientContext(ctx)
+			info.RequestHeader().Set("Authorization", value)
+			return next(ctx, spec)
+		}
 	}
-}
-
-func (b bearer) WrapStreamingClient(next connect.StreamingClientFunc) connect.StreamingClientFunc {
-	return func(ctx context.Context, spec connect.Spec) connect.StreamingClientConn {
-		conn := next(ctx, spec)
-		conn.RequestHeader().Set("Authorization", b.value)
-		return conn
-	}
-}
-
-func (bearer) WrapStreamingHandler(next connect.StreamingHandlerFunc) connect.StreamingHandlerFunc {
-	return next
 }

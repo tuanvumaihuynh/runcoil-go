@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"connectrpc.com/connect"
+	"connectrpc.com/connect/v2"
 	"github.com/stretchr/testify/require"
 	"github.com/tuanvumaihuynh/runcoil-go/internal/runstate"
 	"github.com/tuanvumaihuynh/runcoil-go/pkg/runcoil"
@@ -162,7 +162,7 @@ func TestInternalErrorOnRecordStepIsRetried(t *testing.T) {
 	var calls atomic.Int32
 	f.setRecordHook(func(*runcoilv1.RecordStepRequest) (*runcoilv1.RecordStepResponse, error) {
 		if calls.Add(1) == 1 {
-			return nil, connect.NewError(connect.CodeInternal, errors.New("transient failure"))
+			return nil, connect.NewError(connect.CodeInternal, "transient failure")
 		}
 
 		return nil, nil
@@ -187,7 +187,7 @@ func TestDrainEndsStuckStepReportPromptly(t *testing.T) {
 	})))
 
 	f.setRecordHook(func(*runcoilv1.RecordStepRequest) (*runcoilv1.RecordStepResponse, error) {
-		return nil, connect.NewError(connect.CodeUnavailable, errors.New("server is down"))
+		return nil, connect.NewError(connect.CodeUnavailable, "server is down")
 	})
 
 	h.start(t, w)

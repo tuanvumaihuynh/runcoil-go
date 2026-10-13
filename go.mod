@@ -1,12 +1,14 @@
 module github.com/tuanvumaihuynh/runcoil-go
 
-go 1.26
+go 1.26.0
+
+toolchain go1.26.9
 
 require (
-	connectrpc.com/connect v1.21.0
+	connectrpc.com/connect/v2 v2.0.0
 	github.com/google/uuid v1.6.0
 	github.com/stretchr/testify v1.11.1
-	github.com/tuanvumaihuynh/runcoil-proto v0.0.0-20261012104300-a556af0be958
+	github.com/tuanvumaihuynh/runcoil-proto v0.0.0-20261013164943-89796a57aaa6
 	google.golang.org/protobuf v1.36.12
 )
 

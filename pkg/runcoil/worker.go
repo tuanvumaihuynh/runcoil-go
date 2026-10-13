@@ -4,13 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"connectrpc.com/connect"
+	"connectrpc.com/connect/v2"
+	"connectrpc.com/connect/v2/connectproto"
 	"github.com/google/uuid"
 	runcoilv1 "github.com/tuanvumaihuynh/runcoil-proto/gen/runcoil/v1"
 
@@ -431,13 +433,13 @@ func (w *Worker) register(ctx context.Context, req *runcoilv1.RegisterRequest) e
 	ctx, cancel := context.WithTimeout(ctx, registerTimeout)
 	defer cancel()
 
-	resp, err := w.client.rpc.Register(ctx, connect.NewRequest(req))
+	resp, err := w.client.rpc.Register(ctx, req)
 	if err != nil {
 		return fmt.Errorf("register: %w", err)
 	}
 
-	hb := resp.Msg.GetHeartbeatInterval().AsDuration()
-	lease := resp.Msg.GetLeaseDuration().AsDuration()
+	hb := resp.GetHeartbeatInterval().AsDuration()
+	lease := resp.GetLeaseDuration().AsDuration()
 	if hb <= 0 || lease <= 0 {
 		return errors.New("register: server sent no heartbeat interval or lease duration")
 	}
@@ -540,9 +542,9 @@ func (w *Worker) listenOnce(ctx context.Context) (bool, error) {
 
 	defer watchdog.Stop()
 
-	stream, err := w.client.rpc.Listen(streamCtx, connect.NewRequest(&runcoilv1.ListenRequest{
+	stream, err := w.client.rpc.Listen(streamCtx, &runcoilv1.ListenRequest{
 		InstanceId: w.instance,
-	}))
+	})
 	if err != nil {
 		return false, err
 	}
@@ -550,18 +552,30 @@ func (w *Worker) listenOnce(ctx context.Context) (bool, error) {
 	defer func() { _ = stream.Close() }()
 
 	received := false
-	for stream.Receive() {
+	var streamErr error
+	for {
+		msg, err := stream.Receive()
+		if err != nil {
+			streamErr = err
+			break
+		}
+
 		received = true
 		watchdog.Reset(lease)
 		w.conn.ok(ctx)
-		w.handle(stream.Msg())
+		w.handle(msg)
+	}
+
+	// io.EOF is the clean end of the stream, not a failure.
+	if errors.Is(streamErr, io.EOF) {
+		streamErr = nil
 	}
 
 	if stalled.Load() {
 		return received, fmt.Errorf("no message within the lease of %s", lease)
 	}
 
-	return received, stream.Err()
+	return received, streamErr
 }
 
 // handle acts on one message from the Listen stream.
@@ -715,10 +729,10 @@ func (w *Worker) heartbeat(ctx context.Context) {
 	callCtx, cancel := context.WithTimeout(ctx, w.callTimeout())
 	defer cancel()
 
-	resp, err := w.client.rpc.Heartbeat(callCtx, connect.NewRequest(&runcoilv1.HeartbeatRequest{
+	resp, err := w.client.rpc.Heartbeat(callCtx, &runcoilv1.HeartbeatRequest{
 		InstanceId: w.instance,
 		Attempts:   refs,
-	}))
+	})
 	if err != nil {
 		if ctx.Err() == nil {
 			next, _ := w.timing()
@@ -729,7 +743,7 @@ func (w *Worker) heartbeat(ctx context.Context) {
 	}
 
 	w.conn.ok(ctx)
-	for _, s := range resp.Msg.GetStale() {
+	for _, s := range resp.GetStale() {
 		w.abandon(s.GetRunId(), s.GetLeaseToken())
 	}
 }
@@ -819,7 +833,7 @@ func errorCode(err error) runcoilv1.ErrorCode {
 	}
 
 	for _, d := range ce.Details() {
-		msg, err := d.Value()
+		msg, err := connectproto.UnmarshalErrorDetail(d)
 		if err != nil {
 			continue
 		}
