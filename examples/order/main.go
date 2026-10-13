@@ -128,7 +128,10 @@ func (o *orders) processOrder(ctx context.Context, in orderInput) (orderOutput, 
 	}
 
 	charge, err := step.Do(ctx, "charge", func(ctx context.Context) (string, error) {
-		o.logger.InfoContext(ctx, "step body executed", slog.String("step_id", "charge"), slog.Int("attempt", info.Attempt))
+		o.logger.InfoContext(ctx, "step body executed",
+			slog.String("step_id", "charge"),
+			slog.Int("attempt", info.Attempt),
+		)
 		if o.chargeSleep > 0 {
 			select {
 			case <-time.After(o.chargeSleep):
