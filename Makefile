@@ -1,9 +1,3 @@
-# Runcoil Go SDK. Tools run through `go run`, pinned by version. Nothing is installed globally.
-
-GOLANGCI_LINT_VERSION ?= v2.14.0
-GOVULNCHECK_VERSION ?= v1.9.0
-ACTIONLINT_VERSION ?= v1.7.12
-
 #########################
 # Testing
 #########################
@@ -24,18 +18,11 @@ test-cov:
 ########################
 .PHONY: lint
 lint:
-	go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION) run ./... --config .golangci.yml
+	go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0 run ./... --config .golangci.yml
 
 #########################
 # Vulnerability check
 #########################
 .PHONY: vuln
 vuln:
-	go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
-
-#########################
-# Workflow lint
-#########################
-.PHONY: actionlint
-actionlint:
-	go run github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION)
+	go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...

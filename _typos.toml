@@ -1,4 +1,0 @@
-# Spelling check for the repository. Generated Go code is skipped: buf and protoc write it, nobody edits it by hand.
-
-[files]
-extend-exclude = ["*.pb.go", "*.connect.go"]
