@@ -1,16 +1,12 @@
-// Command schedule runs a worker with worker ID "reports" and one scheduled Task,
-// "report". The server starts a Run every 3 seconds. A Run carries no input; the
-// region is a field of the handler's struct. The Run does one Step that sleeps
-// for REPORT_SLEEP (default 1s), so the overlap rule can be seen by changing it:
-// with REPORT_SLEEP above 3s, a tick that comes while the previous Run is still
-// running creates no Run, because the schedule uses SkipOverlap.
-//
-// Start a server, then run this program with RUNCOIL_ENDPOINT and RUNCOIL_TOKEN
-// set (or the defaults). Stop it with Ctrl-C; it drains running handlers for 30 seconds.
+// Command schedule emails yesterday's sales report at 09:00 UTC, skipping overlap.
+// REPORT_INTERVAL=3s replaces the daily schedule for development. Repeated ticks
+// for the same reporting day reuse the same simulated email delivery.
+// Start a server, then run with RUNCOIL_ENDPOINT and RUNCOIL_TOKEN (or defaults).
 package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"log/slog"
 	"os"
@@ -24,14 +20,14 @@ import (
 )
 
 type reportResult struct {
-	Region string `json:"region"`
-	Rows   int    `json:"rows"`
+	Report    dailyReport `json:"report"`
+	MessageID string      `json:"message_id"`
 }
 
-type reporter struct {
-	logger *slog.Logger
-	region string
-	sleep  time.Duration
+type reporting struct {
+	reports *reportService
+	emails  *emailService
+	logger  *slog.Logger
 }
 
 func main() {
@@ -44,12 +40,28 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	sleep, err := time.ParseDuration(envOr("REPORT_SLEEP", "1s"))
-	if err != nil {
-		return err
+	sched := schedule.Cron("0 9 * * *", schedule.SkipOverlap())
+	if interval := os.Getenv("REPORT_INTERVAL"); interval != "" {
+		duration, err := time.ParseDuration(interval)
+		if err != nil {
+			return err
+		}
+
+		sched = schedule.Every(duration, schedule.SkipOverlap())
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	// Two sample sales from yesterday, in UTC; other reporting days may be empty.
+	yesterday := time.Now().UTC().Truncate(24*time.Hour).AddDate(0, 0, -1)
+	reports := &reportService{
+		sales: []sale{
+			{OccurredAt: yesterday.Add(10 * time.Hour), TotalCents: 2500},
+			{OccurredAt: yesterday.Add(14 * time.Hour), TotalCents: 3900},
+		},
+		logger: logger,
+	}
+	emails := &emailService{messages: make(map[string]string), logger: logger}
+	handler := &reporting{reports: reports, emails: emails, logger: logger}
 
 	client, err := runcoil.NewClient(
 		runcoil.Endpoint(envOr("RUNCOIL_ENDPOINT", "http://localhost:7070")),
@@ -65,9 +77,9 @@ func run() error {
 		return err
 	}
 
-	r := &reporter{logger: logger, region: "eu", sleep: sleep}
-	if err := worker.NewTask("report", runcoil.HandlerFunc(r.report),
-		runcoil.Schedule(schedule.Every(3*time.Second, schedule.SkipOverlap())),
+	if err := worker.NewTask("daily-report", runcoil.HandlerFunc(handler.dailyReport),
+		runcoil.Schedule(sched),
+		runcoil.Retry(runcoil.RetryPolicy{MaxAttempts: 3}),
 	); err != nil {
 		return err
 	}
@@ -76,11 +88,7 @@ func run() error {
 		return err
 	}
 
-	logger.Info("worker started",
-		slog.String("worker_id", "reports"),
-		slog.Duration("report_sleep", sleep),
-	)
-
+	logger.InfoContext(ctx, "worker started", slog.String("worker_id", "reports"))
 	<-ctx.Done()
 
 	drainCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -90,41 +98,46 @@ func run() error {
 		return err
 	}
 
-	logger.Info("worker stopped")
+	logger.InfoContext(drainCtx, "worker stopped")
 	return nil
 }
 
-// report is the handler of a scheduled Run. Its input is the zero value of struct{}.
-func (r *reporter) report(ctx context.Context, _ struct{}) (reportResult, error) {
+// The scheduled Run has no input. Its original tick identifies the report day,
+// so a retry after midnight still builds the same report.
+func (r *reporting) dailyReport(ctx context.Context, _ struct{}) (reportResult, error) {
 	info := runcoil.Info(ctx)
-	logger := r.logger.With(slog.String("run_id", info.RunID))
-	logger.InfoContext(ctx, "report started",
+	if info.ScheduledAt.IsZero() {
+		return reportResult{}, runcoil.Permanent(errors.New("daily-report requires a scheduled Run"))
+	}
+
+	day := info.ScheduledAt.UTC().Truncate(24*time.Hour).AddDate(0, 0, -1)
+	r.logger.InfoContext(ctx, "daily report started",
+		slog.String("run_id", info.RunID),
 		slog.Int("attempt", info.Attempt),
 		slog.Time("scheduled_at", info.ScheduledAt),
-		slog.String("region", r.region),
+		slog.String("report_day", day.Format(time.DateOnly)),
 	)
 
-	rows, err := step.Do(ctx, "build", func(ctx context.Context) (int, error) {
-		select {
-		case <-time.After(r.sleep):
-		case <-ctx.Done():
-			return 0, ctx.Err()
-		}
-
-		return 42, nil
+	report, err := step.Do(ctx, "build-daily-report", func(ctx context.Context) (dailyReport, error) {
+		return r.reports.BuildDaily(ctx, day)
 	})
 	if err != nil {
 		return reportResult{}, err
 	}
 
-	logger.InfoContext(ctx, "report built", slog.Int("rows", rows))
+	messageID, err := step.Do(ctx, "send-report-email", func(ctx context.Context) (string, error) {
+		return r.emails.SendReport(ctx, report)
+	})
+	if err != nil {
+		return reportResult{}, err
+	}
 
-	return reportResult{Region: r.region, Rows: rows}, nil
+	return reportResult{Report: report, MessageID: messageID}, nil
 }
 
 func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+	if value := os.Getenv(key); value != "" {
+		return value
 	}
 
 	return fallback
