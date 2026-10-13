@@ -6,7 +6,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"log"
 	"log/slog"
 	"os"
@@ -106,10 +105,6 @@ func run() error {
 // so a retry after midnight still builds the same report.
 func (r *reporting) dailyReport(ctx context.Context, _ struct{}) (reportResult, error) {
 	info := runcoil.Info(ctx)
-	if info.ScheduledAt.IsZero() {
-		return reportResult{}, runcoil.Permanent(errors.New("daily-report requires a scheduled Run"))
-	}
-
 	day := info.ScheduledAt.UTC().Truncate(24*time.Hour).AddDate(0, 0, -1)
 	r.logger.InfoContext(ctx, "daily report started",
 		slog.String("run_id", info.RunID),
