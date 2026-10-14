@@ -66,3 +66,7 @@ setup and its API.
 
 Use `make test` for race-enabled tests and `make lint` for lint checks. Tools
 run at pinned versions through `go run`.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
