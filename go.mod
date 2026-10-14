@@ -8,7 +8,7 @@ require (
 	connectrpc.com/connect/v2 v2.0.0
 	github.com/google/uuid v1.6.0
 	github.com/stretchr/testify v1.11.1
-	github.com/tuanvumaihuynh/runcoil-proto v0.0.1
+	github.com/tuanvumaihuynh/runcoil-proto v0.0.2
 	google.golang.org/protobuf v1.36.12
 )
 
