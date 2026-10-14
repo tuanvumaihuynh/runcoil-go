@@ -8,7 +8,6 @@ import (
 	"runtime/debug"
 	"sync"
 
-	"connectrpc.com/connect"
 	runcoilv1 "github.com/tuanvumaihuynh/runcoil-proto/gen/runcoil/v1"
 	"google.golang.org/protobuf/types/known/durationpb"
 
@@ -179,10 +178,10 @@ func (w *Worker) refuseDispatch(a *attempt, err error) {
 // server does not refuse is retried a few times before the caller gives up.
 func (w *Worker) ack(a *attempt) error {
 	return w.retryCall(a.life, w.leaseDuration(), ackTries, func(ctx context.Context) error {
-		_, err := w.client.rpc.AckDispatch(ctx, connect.NewRequest(&runcoilv1.AckDispatchRequest{
+		_, err := w.client.rpc.AckDispatch(ctx, &runcoilv1.AckDispatchRequest{
 			RunId:      a.runID,
 			LeaseToken: a.token,
-		}))
+		})
 
 		return err
 	})
@@ -232,17 +231,17 @@ func (w *Worker) finish(ctx context.Context, a *attempt, result *runcoilv1.Finis
 	result.RunId = a.runID
 	result.LeaseToken = a.token
 
-	var resp *connect.Response[runcoilv1.FinishRunResponse]
+	var resp *runcoilv1.FinishRunResponse
 	err := w.retryCall(ctx, w.leaseDuration(), 0, func(ctx context.Context) error {
 		var e error
-		resp, e = w.client.rpc.FinishRun(ctx, connect.NewRequest(result))
+		resp, e = w.client.rpc.FinishRun(ctx, result)
 		return e
 	})
 	if err != nil {
 		return err
 	}
 
-	if retry := resp.Msg.GetRetry(); retry != nil {
+	if retry := resp.GetRetry(); retry != nil {
 		w.logger.DebugContext(a.ctx, "run will be attempted again",
 			slog.String("run_id", a.runID),
 			slog.Time("not_before", retry.GetNotBefore().AsTime()),
@@ -386,10 +385,10 @@ func (w *Worker) recordStep(a *attempt, r runstate.StepReport) (runstate.Record,
 
 	req.Retry = policy
 
-	var resp *connect.Response[runcoilv1.RecordStepResponse]
+	var resp *runcoilv1.RecordStepResponse
 	err = w.retryCall(a.life, w.leaseDuration(), 0, func(ctx context.Context) error {
 		var e error
-		resp, e = w.client.rpc.RecordStep(ctx, connect.NewRequest(req))
+		resp, e = w.client.rpc.RecordStep(ctx, req)
 		return e
 	})
 	if err != nil {
@@ -398,7 +397,7 @@ func (w *Worker) recordStep(a *attempt, r runstate.StepReport) (runstate.Record,
 		return runstate.Record{}, false
 	}
 
-	switch res := resp.Msg.GetResult().(type) {
+	switch res := resp.GetResult().(type) {
 	case *runcoilv1.RecordStepResponse_Recorded:
 		return recordOf(res.Recorded), true
 	case *runcoilv1.RecordStepResponse_Retry:

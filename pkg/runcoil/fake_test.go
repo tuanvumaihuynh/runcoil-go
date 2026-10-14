@@ -3,7 +3,6 @@ package runcoil_test
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -11,7 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"connectrpc.com/connect"
+	"connectrpc.com/connect/v2"
+	"connectrpc.com/connect/v2/connecthttp"
+	"connectrpc.com/connect/v2/connectproto"
 	"github.com/stretchr/testify/require"
 	"github.com/tuanvumaihuynh/runcoil-go/pkg/runcoil"
 	runcoilv1 "github.com/tuanvumaihuynh/runcoil-proto/gen/runcoil/v1"
@@ -73,8 +74,11 @@ func newFakeServer() *fakeServer {
 	}
 }
 
-func (f *fakeServer) checkAuth(h http.Header) {
-	if h.Get("Authorization") != "Bearer "+testToken {
+// checkAuth counts a call whose bearer token is not the test token. It reads the
+// request header from the call's CallInfo.
+func (f *fakeServer) checkAuth(ctx context.Context) {
+	info, _ := connect.CallInfoForServerContext(ctx)
+	if info.RequestHeader().Get("Authorization") != "Bearer "+testToken {
 		f.mu.Lock()
 		f.badAuth++
 		f.mu.Unlock()
@@ -92,26 +96,27 @@ func (f *fakeServer) pushLocked(instance string) chan *runcoilv1.ListenResponse 
 	return ch
 }
 
-func (f *fakeServer) Register(_ context.Context, req *connect.Request[runcoilv1.RegisterRequest]) (*connect.Response[runcoilv1.RegisterResponse], error) {
-	f.checkAuth(req.Header())
+func (f *fakeServer) Register(ctx context.Context, req *runcoilv1.RegisterRequest) (*runcoilv1.RegisterResponse, error) {
+	f.checkAuth(ctx)
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.registers = append(f.registers, req.Msg)
+	f.registers = append(f.registers, req)
 	f.registerTimes = append(f.registerTimes, time.Now())
-	f.lastInstance = req.Msg.GetInstanceId()
+	f.lastInstance = req.GetInstanceId()
 	f.pushLocked(f.lastInstance)
 	if f.registerErr != nil {
-		return nil, f.registerErr
+		// A plain error would reach the client with no message, so the fake sends its text as the message.
+		return nil, connect.NewError(connect.CodeUnknown, f.registerErr.Error())
 	}
 
-	return connect.NewResponse(&runcoilv1.RegisterResponse{
+	return &runcoilv1.RegisterResponse{
 		HeartbeatInterval: durationpb.New(f.hbInterval),
 		LeaseDuration:     durationpb.New(f.lease),
-	}), nil
+	}, nil
 }
 
-func (f *fakeServer) Listen(ctx context.Context, req *connect.Request[runcoilv1.ListenRequest], stream *connect.ServerStream[runcoilv1.ListenResponse]) error {
-	f.checkAuth(req.Header())
+func (f *fakeServer) Listen(ctx context.Context, req *runcoilv1.ListenRequest, stream runcoilv1connect.WorkerServiceListenServerStream) error {
+	f.checkAuth(ctx)
 	f.mu.Lock()
 	f.listens++
 	f.listenTimes = append(f.listenTimes, time.Now())
@@ -120,17 +125,16 @@ func (f *fakeServer) Listen(ctx context.Context, req *connect.Request[runcoilv1.
 		f.notRegistered--
 	}
 
-	push := f.pushLocked(req.Msg.GetInstanceId())
+	push := f.pushLocked(req.GetInstanceId())
 	f.mu.Unlock()
 	if reject {
-		err := connect.NewError(connect.CodeFailedPrecondition, errors.New("instance is not registered"))
-		detail, derr := connect.NewErrorDetail(&runcoilv1.ErrorDetail{Code: runcoilv1.ErrorCode_ERROR_CODE_NOT_REGISTERED})
+		err := connect.NewError(connect.CodeFailedPrecondition, "instance is not registered")
+		detail, derr := connectproto.NewErrorDetail(&runcoilv1.ErrorDetail{Code: runcoilv1.ErrorCode_ERROR_CODE_NOT_REGISTERED})
 		if derr != nil {
-			return derr
+			return connect.NewError(connect.CodeUnknown, derr.Error())
 		}
 
-		err.AddDetail(detail)
-		return err
+		return err.WithDetail(detail)
 	}
 
 	ticker := time.NewTicker(f.hbInterval)
@@ -154,71 +158,70 @@ func (f *fakeServer) Listen(ctx context.Context, req *connect.Request[runcoilv1.
 	}
 }
 
-func (f *fakeServer) Heartbeat(_ context.Context, req *connect.Request[runcoilv1.HeartbeatRequest]) (*connect.Response[runcoilv1.HeartbeatResponse], error) {
-	f.checkAuth(req.Header())
+func (f *fakeServer) Heartbeat(ctx context.Context, req *runcoilv1.HeartbeatRequest) (*runcoilv1.HeartbeatResponse, error) {
+	f.checkAuth(ctx)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.heartbeatDown {
-		return nil, connect.NewError(connect.CodeUnavailable, errors.New("heartbeat is down"))
+		return nil, connect.NewError(connect.CodeUnavailable, "heartbeat is down")
 	}
 
-	f.heartbeats = append(f.heartbeats, req.Msg.GetAttempts())
+	f.heartbeats = append(f.heartbeats, req.GetAttempts())
 	var stale []*runcoilv1.AttemptRef
-	for _, a := range req.Msg.GetAttempts() {
+	for _, a := range req.GetAttempts() {
 		if f.heartbeatStale[a.GetRunId()] {
 			stale = append(stale, a)
 		}
 	}
 
-	return connect.NewResponse(&runcoilv1.HeartbeatResponse{Stale: stale}), nil
+	return &runcoilv1.HeartbeatResponse{Stale: stale}, nil
 }
 
-func (f *fakeServer) AckDispatch(_ context.Context, req *connect.Request[runcoilv1.AckDispatchRequest]) (*connect.Response[runcoilv1.AckDispatchResponse], error) {
-	f.checkAuth(req.Header())
+func (f *fakeServer) AckDispatch(ctx context.Context, req *runcoilv1.AckDispatchRequest) (*runcoilv1.AckDispatchResponse, error) {
+	f.checkAuth(ctx)
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.acks = append(f.acks, req.Msg.GetRunId())
+	f.acks = append(f.acks, req.GetRunId())
 	if f.ackAlways || f.ackUnavailable > 0 {
 		if !f.ackAlways {
 			f.ackUnavailable--
 		}
 
-		return nil, connect.NewError(connect.CodeUnavailable, errors.New("server is down"))
+		return nil, connect.NewError(connect.CodeUnavailable, "server is down")
 	}
 
-	if f.staleRuns[req.Msg.GetRunId()] {
-		err := connect.NewError(connect.CodeFailedPrecondition, errors.New("lease is stale"))
-		detail, derr := connect.NewErrorDetail(&runcoilv1.ErrorDetail{Code: runcoilv1.ErrorCode_ERROR_CODE_STALE_LEASE})
+	if f.staleRuns[req.GetRunId()] {
+		err := connect.NewError(connect.CodeFailedPrecondition, "lease is stale")
+		detail, derr := connectproto.NewErrorDetail(&runcoilv1.ErrorDetail{Code: runcoilv1.ErrorCode_ERROR_CODE_STALE_LEASE})
 		if derr != nil {
-			return nil, derr
+			return nil, connect.NewError(connect.CodeUnknown, derr.Error())
 		}
 
-		err.AddDetail(detail)
-		return nil, err
+		return nil, err.WithDetail(detail)
 	}
 
-	return connect.NewResponse(&runcoilv1.AckDispatchResponse{}), nil
+	return &runcoilv1.AckDispatchResponse{}, nil
 }
 
-func (f *fakeServer) RecordStep(_ context.Context, req *connect.Request[runcoilv1.RecordStepRequest]) (*connect.Response[runcoilv1.RecordStepResponse], error) {
-	f.checkAuth(req.Header())
+func (f *fakeServer) RecordStep(ctx context.Context, req *runcoilv1.RecordStepRequest) (*runcoilv1.RecordStepResponse, error) {
+	f.checkAuth(ctx)
 	f.mu.Lock()
-	f.steps = append(f.steps, req.Msg)
+	f.steps = append(f.steps, req)
 	hook := f.recordHook
 	f.mu.Unlock()
 
 	if hook != nil {
-		resp, err := hook(req.Msg)
+		resp, err := hook(req)
 		if err != nil {
 			return nil, err
 		}
 
 		if resp != nil {
-			return connect.NewResponse(resp), nil
+			return resp, nil
 		}
 	}
 
-	return connect.NewResponse(defaultRecordAnswer(req.Msg)), nil
+	return defaultRecordAnswer(req), nil
 }
 
 // defaultRecordAnswer stores a success as SUCCEEDED and a failure as FAILED, the
@@ -248,27 +251,27 @@ func retryAnswer() *runcoilv1.RecordStepResponse {
 	}}}
 }
 
-func (f *fakeServer) FinishRun(_ context.Context, req *connect.Request[runcoilv1.FinishRunRequest]) (*connect.Response[runcoilv1.FinishRunResponse], error) {
-	f.checkAuth(req.Header())
+func (f *fakeServer) FinishRun(ctx context.Context, req *runcoilv1.FinishRunRequest) (*runcoilv1.FinishRunResponse, error) {
+	f.checkAuth(ctx)
 	f.mu.Lock()
 	if f.finishOutage > 0 {
 		f.finishOutage--
 		f.mu.Unlock()
-		return nil, connect.NewError(connect.CodeUnavailable, errors.New("server is down"))
+		return nil, connect.NewError(connect.CodeUnavailable, "server is down")
 	}
 
 	retry := f.finishRetry
 	f.finishRetry = false
 	f.mu.Unlock()
 
-	f.finishes <- req.Msg
+	f.finishes <- req
 	if retry {
-		return connect.NewResponse(&runcoilv1.FinishRunResponse{Result: &runcoilv1.FinishRunResponse_Retry{
+		return &runcoilv1.FinishRunResponse{Result: &runcoilv1.FinishRunResponse_Retry{
 			Retry: &runcoilv1.RetryScheduled{NotBefore: timestamppb.Now(), AttemptsUsed: 1},
-		}}), nil
+		}}, nil
 	}
 
-	return connect.NewResponse(&runcoilv1.FinishRunResponse{}), nil
+	return &runcoilv1.FinishRunResponse{}, nil
 }
 
 // update changes the fake's state under its lock, before or during a test.
@@ -467,9 +470,11 @@ func (h *harness) setDown(down bool) {
 
 func newHarness(t *testing.T, f *fakeServer) *harness {
 	t.Helper()
+	// Reads are unbounded, as in v1, so the fake accepts any message the SDK sends.
+	server := connect.NewServer()
+	runcoilv1connect.RegisterWorkerServiceHandler(server, f)
 	mux := http.NewServeMux()
-	path, handler := runcoilv1connect.NewWorkerServiceHandler(f)
-	mux.Handle(path, handler)
+	connecthttp.Mount(mux, server, connecthttp.WithReadMaxBytes(0))
 	h := &harness{fake: f}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if h.down.Load() {
