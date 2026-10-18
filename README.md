@@ -44,6 +44,32 @@ func (o *onboarding) createAccount(ctx context.Context, in onboardingInput) (onb
 On retry, Steps with recorded successes return their stored results. Service
 calls still need idempotency if a process dies before the result is recorded.
 
+## Start and shut down
+
+Pass `Start` a context that ends on Ctrl-C or SIGTERM. When the signal arrives,
+shut the worker down with a drain context:
+
+```go
+ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+defer stop()
+
+if err := worker.Start(ctx); err != nil {
+	return err
+}
+
+<-ctx.Done()
+
+drainCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+
+return worker.Shutdown(drainCtx)
+```
+
+While the server is unavailable, for example while it is shutting down, `Start`
+waits and registers again until it succeeds or its context ends. `Shutdown`
+closes the Listen stream and waits for running handlers. When the drain context
+ends first, it cancels the handlers still running and reports them as released.
+
 ## Examples
 
 See [examples](examples/) for complete programs, setup, run commands, and retry

@@ -11,10 +11,13 @@ import (
 	"testing"
 	"time"
 
+	"connectrpc.com/connect/v2"
+	"connectrpc.com/connect/v2/connectproto"
 	"github.com/stretchr/testify/require"
 	"github.com/tuanvumaihuynh/runcoil-go/pkg/runcoil"
 	"github.com/tuanvumaihuynh/runcoil-go/pkg/schedule"
 	"github.com/tuanvumaihuynh/runcoil-go/pkg/step"
+	runcoilv1 "github.com/tuanvumaihuynh/runcoil-proto/gen/runcoil/v1"
 )
 
 // A result that is being reported when the drain deadline passes is not cut
@@ -766,6 +769,174 @@ func TestStartReturnsRegisterError(t *testing.T) {
 	})))
 
 	require.Error(t, w.Start(context.Background()), "Start succeeded although Register failed")
+}
+
+// Start registers again while the server answers unavailable, then listens.
+func TestStartRetriesRegistrationWhileServerUnavailable(t *testing.T) {
+	f := newFakeServer()
+	f.update(func(f *fakeServer) { f.registerUnavailable = 2 })
+	h := newHarness(t, f)
+	logs := &capture{}
+	w := h.workerFor(t, h.clientWith(t, runcoil.Logger(slog.New(logs))), "demo")
+	require.NoError(t, w.NewTask("hello", runcoil.HandlerFunc(func(context.Context, struct{}) (struct{}, error) {
+		return struct{}{}, nil
+	})))
+
+	h.start(t, w)
+
+	require.Equal(t, 3, f.registerCount(), "register calls")
+	require.Equal(t, 2, logs.count(slog.LevelInfo, "server unavailable; retrying registration"), "retry lines")
+	first, _ := logs.first("server unavailable; retrying registration")
+	require.EqualValues(t, 1, first.attrs["attempt"], "retry attributes = %v", first.attrs)
+	require.Equal(t, 500*time.Millisecond, first.attrs["next_delay"], "retry attributes = %v", first.attrs)
+
+	f.dispatch(t, testDispatch("run_rr1", "tok_rr1", "hello", ""))
+	fin := f.nextFinish(t)
+	require.Equal(t, "run_rr1", fin.GetRunId())
+	require.NotNil(t, fin.GetSucceeded(), "finish = run %q result %v, want succeeded", fin.GetRunId(), fin.GetResult())
+}
+
+// A context that ends while Start waits between registration attempts makes Start
+// return its cause. No Listen or heartbeat loop starts, and Shutdown returns nil.
+func TestStartStopsRetryWhenContextEnds(t *testing.T) {
+	custom := errors.New("operator asked for a stop")
+	cases := map[string]struct {
+		cancel func(context.CancelCauseFunc)
+		want   error
+	}{
+		"plain cancel": {
+			cancel: func(cancel context.CancelCauseFunc) { cancel(nil) },
+			want:   context.Canceled,
+		},
+		"custom cause": {
+			cancel: func(cancel context.CancelCauseFunc) { cancel(custom) },
+			want:   custom,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newFakeServer()
+			f.update(func(f *fakeServer) { f.registerUnavailable = 1000 })
+			h := newHarness(t, f)
+			logs := &capture{}
+			w := h.workerFor(t, h.clientWith(t, runcoil.Logger(slog.New(logs))), "demo")
+			require.NoError(t, w.NewTask("hello", runcoil.HandlerFunc(func(context.Context, struct{}) (struct{}, error) {
+				return struct{}{}, nil
+			})))
+
+			ctx, cancel := context.WithCancelCause(context.Background())
+			defer cancel(nil)
+			done := make(chan error, 1)
+			go func() { done <- w.Start(ctx) }()
+
+			waitFor(t, "the first retry line", func() bool {
+				return logs.count(slog.LevelInfo, "server unavailable; retrying registration") >= 1
+			})
+			tc.cancel(cancel)
+
+			select {
+			case err := <-done:
+				require.ErrorIs(t, err, tc.want, "Start error")
+			case <-time.After(5 * time.Second):
+				require.Fail(t, "Start did not return after its context ended")
+			}
+
+			time.Sleep(200 * time.Millisecond)
+			require.Zero(t, f.listenCount(), "Listen calls after a failed Start")
+			require.NoError(t, w.Shutdown(context.Background()), "shutdown after a failed Start")
+		})
+	}
+}
+
+// Any other Register error fails Start on the first try.
+func TestStartFailsAtOnceOnOtherRegisterErrors(t *testing.T) {
+	protocol, err := connectproto.NewErrorDetail(&runcoilv1.ErrorDetail{Code: runcoilv1.ErrorCode_ERROR_CODE_INCOMPATIBLE_PROTOCOL})
+	require.NoError(t, err)
+
+	cases := map[string]error{
+		"invalid argument":      connect.NewError(connect.CodeInvalidArgument, "bad task definition"),
+		"incompatible protocol": connect.NewError(connect.CodeFailedPrecondition, "protocol 9 is not supported").WithDetail(protocol),
+	}
+	for name, fail := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newFakeServer()
+			f.update(func(f *fakeServer) { f.registerFail = fail })
+			h := newHarness(t, f)
+			w := h.worker(t)
+			require.NoError(t, w.NewTask("hello", runcoil.HandlerFunc(func(context.Context, struct{}) (struct{}, error) {
+				return struct{}{}, nil
+			})))
+
+			require.Error(t, w.Start(context.Background()), "Start succeeded although Register failed")
+			require.Equal(t, 1, f.registerCount(), "register calls")
+		})
+	}
+}
+
+// Shutdown called while Start waits between registration attempts makes Start
+// return the shut-down error without another Register call.
+func TestShutdownDuringRegistrationRetryStopsStart(t *testing.T) {
+	f := newFakeServer()
+	f.update(func(f *fakeServer) { f.registerUnavailable = 1000 })
+	h := newHarness(t, f)
+	logs := &capture{}
+	w := h.workerFor(t, h.clientWith(t, runcoil.Logger(slog.New(logs))), "demo")
+	require.NoError(t, w.NewTask("hello", runcoil.HandlerFunc(func(context.Context, struct{}) (struct{}, error) {
+		return struct{}{}, nil
+	})))
+
+	done := make(chan error, 1)
+	go func() { done <- w.Start(context.Background()) }()
+
+	waitFor(t, "the first retry line", func() bool {
+		return logs.count(slog.LevelInfo, "server unavailable; retrying registration") >= 1
+	})
+	require.NoError(t, w.Shutdown(context.Background()), "shutdown")
+
+	select {
+	case err := <-done:
+		require.ErrorContains(t, err, "worker was shut down while starting")
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "Start did not return after Shutdown")
+	}
+
+	require.Equal(t, 1, f.registerCount(), "register calls, want none after Shutdown")
+}
+
+// The server refuses Listen with unavailable several times in a row. The worker
+// backs off between the attempts, and the outage logs one warning.
+func TestListenRefusedWhileUnavailableBacksOff(t *testing.T) {
+	f := newFakeServer()
+	f.update(func(f *fakeServer) {
+		f.listenUnavailable = 3
+		f.heartbeatDown = true // an answered heartbeat would end each wait early
+	})
+	h := newHarness(t, f)
+	logs := &capture{}
+	w := h.workerFor(t, h.clientWith(t, runcoil.Logger(slog.New(logs))), "demo")
+	require.NoError(t, w.NewTask("hello", runcoil.HandlerFunc(func(context.Context, struct{}) (struct{}, error) {
+		return struct{}{}, nil
+	})))
+
+	h.start(t, w)
+
+	waitFor(t, "four Listen attempts", func() bool { return f.listenCount() >= 4 })
+
+	f.mu.Lock()
+	times := append([]time.Time(nil), f.listenTimes...)
+	f.mu.Unlock()
+
+	// The waits are the reconnect backoff: 500 ms, 1 s, then 2 s. Each gap must
+	// be at least three quarters of its wait, so a hot loop fails.
+	for i, want := range []time.Duration{500 * time.Millisecond, time.Second, 2 * time.Second} {
+		gap := times[i+1].Sub(times[i])
+		require.GreaterOrEqual(t, gap, want*3/4, "gap before Listen attempt %d", i+2)
+	}
+
+	require.Equal(t, 1, logs.count(slog.LevelWarn, "server connection lost"), "lost warnings")
+	require.Equal(t, 1, logs.countLevel(slog.LevelWarn), "warnings, want only the lost warning")
+	require.GreaterOrEqual(t, logs.count(slog.LevelDebug, "server connection attempt failed"), 2, "debug lines")
 }
 
 func TestRegisterSendsPoliciesAndDeadline(t *testing.T) {
