@@ -768,6 +768,41 @@ func TestStartReturnsRegisterError(t *testing.T) {
 	require.Error(t, w.Start(context.Background()), "Start succeeded although Register failed")
 }
 
+// The server refuses Listen with unavailable several times in a row. The worker
+// backs off between the attempts, and the outage logs one warning.
+func TestListenRefusedWhileUnavailableBacksOff(t *testing.T) {
+	f := newFakeServer()
+	f.update(func(f *fakeServer) {
+		f.listenUnavailable = 3
+		f.heartbeatDown = true // an answered heartbeat would end each wait early
+	})
+	h := newHarness(t, f)
+	logs := &capture{}
+	w := h.workerFor(t, h.clientWith(t, runcoil.Logger(slog.New(logs))), "demo")
+	require.NoError(t, w.NewTask("hello", runcoil.HandlerFunc(func(context.Context, struct{}) (struct{}, error) {
+		return struct{}{}, nil
+	})))
+
+	h.start(t, w)
+
+	waitFor(t, "four Listen attempts", func() bool { return f.listenCount() >= 4 })
+
+	f.mu.Lock()
+	times := append([]time.Time(nil), f.listenTimes...)
+	f.mu.Unlock()
+
+	// The waits are the reconnect backoff: 500 ms, 1 s, then 2 s. Each gap must
+	// be at least three quarters of its wait, so a hot loop fails.
+	for i, want := range []time.Duration{500 * time.Millisecond, time.Second, 2 * time.Second} {
+		gap := times[i+1].Sub(times[i])
+		require.GreaterOrEqual(t, gap, want*3/4, "gap before Listen attempt %d", i+2)
+	}
+
+	require.Equal(t, 1, logs.count(slog.LevelWarn, "server connection lost"), "lost warnings")
+	require.Equal(t, 1, logs.countLevel(slog.LevelWarn), "warnings, want only the lost warning")
+	require.GreaterOrEqual(t, logs.count(slog.LevelDebug, "server connection attempt failed"), 2, "debug lines")
+}
+
 func TestRegisterSendsPoliciesAndDeadline(t *testing.T) {
 	f := newFakeServer()
 	h := newHarness(t, f)

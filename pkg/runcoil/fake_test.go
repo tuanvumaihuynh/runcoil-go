@@ -39,27 +39,28 @@ type fakeServer struct {
 	finishes chan *runcoilv1.FinishRunRequest
 	drop     chan struct{} // each value ends the open Listen stream, as a server would
 
-	mu             sync.Mutex
-	badAuth        int
-	registers      []*runcoilv1.RegisterRequest
-	registerErr    error
-	listens        int
-	notRegistered  int                                       // Listen answers NOT_REGISTERED this many more times
-	pushes         map[string]chan *runcoilv1.ListenResponse // by instance ID
-	lastInstance   string
-	staleRuns      map[string]bool // AckDispatch answers STALE_LEASE for these runs
-	ackUnavailable int             // AckDispatch answers Unavailable this many more times
-	ackAlways      bool            // AckDispatch always answers Unavailable
-	acks           []string        // every AckDispatch call, by run ID
-	finishOutage   int             // FinishRun answers Unavailable this many more times
-	finishRetry    bool            // the next FinishRun answers retry
-	heartbeats     [][]*runcoilv1.AttemptRef
-	heartbeatStale map[string]bool // Heartbeat names these runs as stale
-	heartbeatDown  bool            // Heartbeat answers unavailable while set
-	registerTimes  []time.Time     // when each Register arrived
-	listenTimes    []time.Time     // when each Listen arrived
-	steps          []*runcoilv1.RecordStepRequest
-	recordHook     recordHook
+	mu                sync.Mutex
+	badAuth           int
+	registers         []*runcoilv1.RegisterRequest
+	registerErr       error
+	listens           int
+	notRegistered     int                                       // Listen answers NOT_REGISTERED this many more times
+	listenUnavailable int                                       // Listen answers unavailable this many more times
+	pushes            map[string]chan *runcoilv1.ListenResponse // by instance ID
+	lastInstance      string
+	staleRuns         map[string]bool // AckDispatch answers STALE_LEASE for these runs
+	ackUnavailable    int             // AckDispatch answers Unavailable this many more times
+	ackAlways         bool            // AckDispatch always answers Unavailable
+	acks              []string        // every AckDispatch call, by run ID
+	finishOutage      int             // FinishRun answers Unavailable this many more times
+	finishRetry       bool            // the next FinishRun answers retry
+	heartbeats        [][]*runcoilv1.AttemptRef
+	heartbeatStale    map[string]bool // Heartbeat names these runs as stale
+	heartbeatDown     bool            // Heartbeat answers unavailable while set
+	registerTimes     []time.Time     // when each Register arrived
+	listenTimes       []time.Time     // when each Listen arrived
+	steps             []*runcoilv1.RecordStepRequest
+	recordHook        recordHook
 }
 
 func newFakeServer() *fakeServer {
@@ -125,8 +126,17 @@ func (f *fakeServer) Listen(ctx context.Context, req *runcoilv1.ListenRequest, s
 		f.notRegistered--
 	}
 
+	refuse := f.listenUnavailable > 0
+	if refuse {
+		f.listenUnavailable--
+	}
+
 	push := f.pushLocked(req.GetInstanceId())
 	f.mu.Unlock()
+	if refuse {
+		return connect.NewError(connect.CodeUnavailable, "server is shutting down")
+	}
+
 	if reject {
 		err := connect.NewError(connect.CodeFailedPrecondition, "instance is not registered")
 		detail, derr := connectproto.NewErrorDetail(&runcoilv1.ErrorDetail{Code: runcoilv1.ErrorCode_ERROR_CODE_NOT_REGISTERED})
