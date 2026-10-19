@@ -65,8 +65,10 @@ defer cancel()
 return worker.Shutdown(drainCtx)
 ```
 
-While the server is unavailable, for example while it is shutting down, `Start`
-waits and registers again until it succeeds or its context ends. `Shutdown`
+When registration fails, `Start` returns the error, so a process that cannot
+reach the server exits and its supervisor can restart it. Once started, the
+worker reconnects with backoff while the server is unavailable, for example
+while it restarts. `Shutdown`
 closes the Listen stream and waits for running handlers. When the drain context
 ends first, it cancels the handlers still running and reports them as released.
 

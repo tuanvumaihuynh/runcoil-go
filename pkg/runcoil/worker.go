@@ -226,10 +226,9 @@ func (w *Worker) NewTask(id string, h Handler, opts ...TaskOption) error {
 }
 
 // Start registers the Tasks with the server and then listens for Runs in the
-// background. While the server answers unavailable, because it is stopping or
-// cannot be reached, Start waits with the reconnect backoff and registers again,
-// logging each retry, until ctx ends. Other errors return at once. The context
-// bounds only the registration: the worker keeps running until Shutdown.
+// background. It returns once registration succeeds, and returns the error when
+// it fails. The context bounds only the registration call: the worker keeps
+// running until Shutdown.
 func (w *Worker) Start(ctx context.Context) error {
 	w.mu.Lock()
 
@@ -245,7 +244,7 @@ func (w *Worker) Start(ctx context.Context) error {
 	w.starting = true
 	w.mu.Unlock()
 
-	if err := w.registerUntilAvailable(ctx); err != nil {
+	if err := w.register(ctx, w.registerRequest()); err != nil {
 		w.mu.Lock()
 		w.starting = false
 		w.mu.Unlock()
@@ -426,43 +425,6 @@ func (w *Worker) registerRequest() *runcoilv1.RegisterRequest {
 		SdkName:               sdkName,
 		SdkVersion:            sdkVersion,
 	}
-}
-
-// registerUntilAvailable registers the Tasks. While the server answers
-// unavailable, it waits with the reconnect backoff and registers again, until
-// ctx ends or Shutdown is called. Any other error returns at once.
-func (w *Worker) registerUntilAvailable(ctx context.Context) error {
-	req := w.registerRequest()
-	delay := reconnectStart
-	for attempt := 1; ; attempt++ {
-		err := w.register(ctx, req)
-		if !unavailable(err) {
-			return err
-		}
-
-		w.logger.InfoContext(ctx, "server unavailable; retrying registration",
-			slog.Int("attempt", attempt),
-			slog.Duration("next_delay", delay),
-			slog.Any("error", err),
-		)
-
-		if !sleep(ctx, delay) {
-			return fmt.Errorf("%w; last registration error: %w", context.Cause(ctx), err)
-		}
-
-		if w.isStopped() {
-			return errors.New("worker was shut down while starting")
-		}
-
-		delay = min(2*delay, reconnectCap)
-	}
-}
-
-// isStopped reports whether Shutdown has been called.
-func (w *Worker) isStopped() bool {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.stopped
 }
 
 // register sends the Tasks to the server and keeps its heartbeat and lease
@@ -860,13 +822,6 @@ func retryable(err error) bool {
 	default:
 		return false
 	}
-}
-
-// unavailable reports whether the server answered unavailable without a Runcoil
-// error code. The server answers so while it drains, and connect reports a
-// refused connection the same way.
-func unavailable(err error) bool {
-	return connect.CodeOf(err) == connect.CodeUnavailable && errorCode(err) == runcoilv1.ErrorCode_ERROR_CODE_UNSPECIFIED
 }
 
 // errorCode returns the Runcoil error code in the details of err, or
