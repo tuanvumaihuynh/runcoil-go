@@ -176,6 +176,29 @@ func TestInvokeRetriesWithOneGeneratedKey(t *testing.T) {
 	assert.Equal(t, 2, logs.count(slog.LevelDebug, "call failed; retrying"))
 }
 
+func TestUnspecifiedDetailIsRetried(t *testing.T) {
+	f := &fakeRuns{invoke: func(n int, _ *runcoilv1.InvokeRequest) (*runcoilv1.InvokeResponse, error) {
+		if n == 1 {
+			// The detail is present but its code is UNSPECIFIED, so the failure has no Runcoil answer.
+			return nil, runcoilErr(t, connect.CodeUnavailable, "server is shutting down", &runcoilv1.ErrorDetail{
+				Code: runcoilv1.ErrorCode_ERROR_CODE_UNSPECIFIED,
+			})
+		}
+
+		return &runcoilv1.InvokeResponse{RunId: "run-1"}, nil
+	}}
+	c := newRunsClient(t, f, nil)
+
+	inv, err := c.Invoke(context.Background(), runcoil.InvokeRequest{
+		WorkerID:       "accounts",
+		TaskID:         "create-account",
+		IdempotencyKey: "k",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "run-1", inv.RunID)
+	assert.Len(t, received[*runcoilv1.InvokeRequest](f), 2)
+}
+
 func TestInvokeKeepsGivenKey(t *testing.T) {
 	f := &fakeRuns{invoke: func(int, *runcoilv1.InvokeRequest) (*runcoilv1.InvokeResponse, error) {
 		return &runcoilv1.InvokeResponse{RunId: "run-1", Deduplicated: true}, nil
@@ -350,6 +373,60 @@ func TestWaitRunCallsAgainAfterTimedOut(t *testing.T) {
 		assert.Nil(t, r.GetTimeout(), "no timeout is sent; the server's maximum applies")
 		assert.True(t, r.GetIncludeSteps())
 	}
+}
+
+// TestWaitRunRestartsBackoffAfterTimedOut fails twice before a timed_out answer, so the
+// backoff has doubled when the answer arrives. A failure after that answer must start
+// again at retryStart.
+func TestWaitRunRestartsBackoffAfterTimedOut(t *testing.T) {
+	unavailable := connect.NewError(connect.CodeUnavailable, "server is shutting down")
+	f := &fakeRuns{waitRun: func(n int, _ *runcoilv1.WaitRunRequest) (*runcoilv1.WaitRunResponse, error) {
+		switch n {
+		case 1, 2, 4:
+			return nil, unavailable
+		case 3:
+			return &runcoilv1.WaitRunResponse{
+				Run:      &runcoilv1.Run{RunId: "run-1", Status: runcoilv1.RunStatus_RUN_STATUS_RUNNING},
+				TimedOut: true,
+			}, nil
+		default:
+			return &runcoilv1.WaitRunResponse{Run: &runcoilv1.Run{
+				RunId:    "run-1",
+				Status:   runcoilv1.RunStatus_RUN_STATUS_SUCCEEDED,
+				Terminal: true,
+			}}, nil
+		}
+	}}
+	logs := &capture{}
+	c := newRunsClient(t, f, slog.New(logs))
+
+	run, err := c.WaitRun(context.Background(), runcoil.WaitRunRequest{RunID: "run-1"})
+	require.NoError(t, err)
+	assert.Equal(t, runcoil.RunSucceeded, run.Status)
+	require.Len(t, received[*runcoilv1.WaitRunRequest](f), 5)
+
+	// One line per failed call: the doubling within the first failures, then the restart after timed_out.
+	assert.Equal(t, []time.Duration{
+		250 * time.Millisecond,
+		500 * time.Millisecond,
+		250 * time.Millisecond,
+	}, retryDelays(logs))
+}
+
+// retryDelays returns the next_delay of each retry line that the client logged, in order.
+func retryDelays(c *capture) []time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var out []time.Duration
+	for _, e := range c.entries {
+		if e.msg == "call failed; retrying" {
+			d, _ := e.attrs["next_delay"].(time.Duration)
+			out = append(out, d)
+		}
+	}
+
+	return out
 }
 
 func TestFailedRunIsReturnedWithoutError(t *testing.T) {
@@ -529,4 +606,29 @@ func TestRerunSendsFromStepAndKey(t *testing.T) {
 	assert.Equal(t, "rerun/acct-ada/1", reqs[0].GetIdempotencyKey())
 	assert.Empty(t, reqs[1].GetFromStepId(), "an empty step means a rerun from the start")
 	assert.Equal(t, inv.IdempotencyKey, reqs[1].GetIdempotencyKey())
+}
+
+func TestRerunRetriesWithOneGeneratedKey(t *testing.T) {
+	f := &fakeRuns{rerun: func(n int, _ *runcoilv1.RerunRequest) (*runcoilv1.RerunResponse, error) {
+		if n == 1 {
+			return nil, connect.NewError(connect.CodeUnavailable, "server is shutting down")
+		}
+
+		return &runcoilv1.RerunResponse{RunId: "run-2"}, nil
+	}}
+	c := newRunsClient(t, f, nil)
+
+	inv, err := c.Rerun(context.Background(), runcoil.RerunRequest{RunID: "run-0"})
+	require.NoError(t, err)
+	assert.Equal(t, "run-2", inv.RunID)
+
+	reqs := received[*runcoilv1.RerunRequest](f)
+	require.Len(t, reqs, 2)
+	key := reqs[0].GetIdempotencyKey()
+	assert.Equal(t, key, reqs[1].GetIdempotencyKey(), "every try sends the same key")
+
+	id, err := uuid.Parse(key)
+	require.NoError(t, err)
+	assert.Equal(t, uuid.Version(7), id.Version())
+	assert.Equal(t, key, inv.IdempotencyKey)
 }

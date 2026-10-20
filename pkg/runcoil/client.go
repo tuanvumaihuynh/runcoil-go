@@ -127,7 +127,7 @@ func Logger(l *slog.Logger) ClientOption {
 type InvokeRequest struct {
 	WorkerID       string // the worker ID that owns the Task
 	TaskID         string // the ID of the Task under its worker ID
-	Input          any    // encoded with encoding/json; nil sends no input
+	Input          any    // encoded with encoding/json; nil sends no input; see Invoke for []byte
 	IdempotencyKey string // empty: the SDK generates a UUIDv7
 }
 
@@ -229,6 +229,8 @@ func (e *Error) Unwrap() error {
 // the same key and input returns the same Run, with Deduplicated set. A key
 // that the SDK generates protects only this call's own retries; to protect a
 // trigger that can repeat, give a key derived from the business identity.
+// Input that is already JSON must be a json.RawMessage, which is sent as that
+// JSON; encoding/json turns a []byte into a base64 string.
 func (c *Client) Invoke(ctx context.Context, req InvokeRequest) (Invocation, error) {
 	input, err := encodeInput(req.Input)
 	if err != nil {
@@ -429,7 +431,7 @@ func retryRPC[T any](ctx context.Context, logger *slog.Logger, procedure string,
 	backoff := retryStart
 	for try := 1; ; try++ {
 		answer, err := op()
-		if err == nil || errorDetail(err) != nil {
+		if err == nil || errorCode(err) != runcoilv1.ErrorCode_ERROR_CODE_UNSPECIFIED {
 			return answer, err
 		}
 
@@ -462,7 +464,7 @@ func newError(err error, key string) *Error {
 	e := &Error{Message: err.Error(), IdempotencyKey: key, err: err}
 
 	d := errorDetail(err)
-	if d == nil {
+	if d == nil || d.GetCode() == runcoilv1.ErrorCode_ERROR_CODE_UNSPECIFIED {
 		return e
 	}
 
