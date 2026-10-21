@@ -1,9 +1,11 @@
 # Examples
 
-Runnable examples for the Runcoil Go SDK. Each program registers a worker,
-connects to the server, and drains running handlers on shutdown.
+Runnable examples for the Runcoil Go SDK. The worker programs register a worker,
+connect to the server, and drain running handlers on shutdown. The invoke program
+calls a Task and waits for its Run.
 
 - [Onboarding](onboarding/): create an account and send a welcome email through separate application services.
+- [Invoke](invoke/): invoke the onboarding Task, wait for its Run, and print the result.
 - [Scheduled report](schedule/): build yesterday's sales report and email it at 09:00 UTC.
 - [Hello](hello/): the minimal worker used by the server quick start.
 
@@ -27,7 +29,17 @@ Examples read `RUNCOIL_ENDPOINT` (default `http://localhost:7070`) and
 `RUNCOIL_TOKEN` (default `dev-token`). Stop with Ctrl-C to drain running
 handlers for up to 30 seconds.
 
-In another terminal, invoke worker `accounts`, Task `create-account`:
+In another terminal, invoke worker `accounts`, Task `create-account`, and wait
+for the result with the SDK:
+
+```sh
+go run ./examples/invoke
+```
+
+It prints the account and welcome email IDs when the Run succeeds. When the Run
+fails, it prints the failure code, message, and Step.
+
+Without the SDK, call the server API directly. Invoke the same Task with `curl`:
 
 ```sh
 curl --fail-with-body -sS http://localhost:7070/runcoil.v1.RunService/Invoke \
@@ -73,8 +85,11 @@ To observe an email retry, start the onboarding worker with:
 EMAIL_FAIL_ONCE=true go run ./examples/onboarding
 ```
 
-Invoke a new Run. The simulated email service fails its first delivery attempt
-for each welcome-email key. The account Step returns its recorded result on
+Invoke a new Run with a new idempotency key. The SDK example uses the key
+`onboarding/acct-ada`, which returns the original Run; change that key in
+`examples/invoke/main.go`, or use a new key with the `curl` commands. The
+simulated email service fails its first delivery attempt for each welcome-email
+key. The account Step returns its recorded result on
 retry, and email delivery is tried again. Once email retries are exhausted,
 the Run fails and the account remains created.
 
