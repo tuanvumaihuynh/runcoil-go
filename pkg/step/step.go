@@ -46,8 +46,8 @@ func (cfg *cfg) validate() error {
 	}
 
 	for _, d := range cfg.retry.Delays {
-		if d < 0 {
-			return fmt.Errorf("step %q: retry delays must not be negative", cfg.id)
+		if d <= 0 {
+			return fmt.Errorf("step %q: retry delays must be greater than 0", cfg.id)
 		}
 	}
 

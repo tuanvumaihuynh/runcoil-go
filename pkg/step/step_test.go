@@ -7,6 +7,7 @@ import (
 	"math"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/tuanvumaihuynh/runcoil-go/internal/runstate"
@@ -57,6 +58,38 @@ func TestDoRejectsMaxAttemptsTooLargeBeforeRunning(t *testing.T) {
 
 	want := fmt.Sprintf("step %q: retry max attempts %d is too large", "charge", math.MaxInt)
 	require.EqualError(t, err, want)
+}
+
+func TestDoValidatesRetryDelaysBeforeRunning(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		delay time.Duration
+	}{
+		{name: "zero", delay: 0},
+		{name: "positive", delay: time.Nanosecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := runstate.With(context.Background(), &runstate.State{
+				Open: func() bool { return true },
+				Report: func(context.Context, runstate.StepReport) (runstate.Record, bool) {
+					return runstate.Record{Succeeded: true, Output: []byte(`"ch_1"`)}, true
+				},
+			})
+
+			ran := false
+			_, err := step.Do(ctx, "charge", func(context.Context) (string, error) {
+				ran = true
+				return "ch_1", nil
+			}, step.Retry(step.RetryPolicy{Delays: []time.Duration{tc.delay}}))
+			if tc.delay == 0 {
+				require.EqualError(t, err, `step "charge": retry delays must be greater than 0`)
+				require.False(t, ran, "function ran before the policy was refused")
+			} else {
+				require.NoError(t, err)
+				require.True(t, ran)
+			}
+		})
+	}
 }
 
 func TestInfoOutsideRunIsZero(t *testing.T) {

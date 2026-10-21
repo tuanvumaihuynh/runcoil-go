@@ -40,6 +40,11 @@ func TestNewTaskValidates(t *testing.T) {
 	require.Error(t, w.NewTask("neg-attempts", fn, runcoil.Retry(runcoil.RetryPolicy{MaxAttempts: -1})),
 		"negative attempts accepted")
 
+	require.ErrorContains(t, w.NewTask("zero-delay", fn, runcoil.Retry(runcoil.RetryPolicy{Delays: []time.Duration{0}})),
+		"retry: delays must be greater than 0")
+
+	require.NoError(t, w.NewTask("positive-delay", fn, runcoil.Retry(runcoil.RetryPolicy{Delays: []time.Duration{time.Nanosecond}})))
+
 	require.Error(t, w.NewTask("neg-deadline", fn, runcoil.StartDeadline(-time.Second)), "negative start deadline accepted")
 
 	require.NoError(t, w.NewTask("hello", fn, runcoil.Schedule(schedule.Daily(schedule.At(9, 0), schedule.At(17, 30)))))

@@ -69,7 +69,7 @@ type RetryPolicy struct {
 	// Zero means the server's default.
 	MaxAttempts int
 	// Delays is the wait before each retry. The last value repeats. Nil means
-	// the server's default.
+	// the server's default. Each delay must be greater than 0.
 	Delays []time.Duration
 }
 
@@ -195,8 +195,8 @@ func definition(cfg taskCfg) *runcoilv1.TaskDefinition {
 	return def
 }
 
-// validate checks the policy: a negative value, or a max attempts that does not
-// fit in the message. Its error text starts with "retry:".
+// validate checks for positive delays and a non-negative max attempts that fits
+// in the message. Its error text starts with "retry:".
 func (p RetryPolicy) validate() error {
 	if p.MaxAttempts < 0 {
 		return errors.New("retry: max attempts must not be negative")
@@ -207,8 +207,8 @@ func (p RetryPolicy) validate() error {
 	}
 
 	for _, d := range p.Delays {
-		if d < 0 {
-			return errors.New("retry: delays must not be negative")
+		if d <= 0 {
+			return errors.New("retry: delays must be greater than 0")
 		}
 	}
 
